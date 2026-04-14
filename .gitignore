@@ -1,0 +1,12 @@
+experience/
+preset/
+__pycache__/
+*.py[cod]
+*.pyc.*
+.DS_Store
+*.log
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx

@@ -1,0 +1,15 @@
+CUDA_VISIBLE_DEVICES=0 python test_daspsr.py \
+--pretrained_model_path preset/models/stable-diffusion-2-base \
+--prompt '' \
+--daspsr_model_path preset/models/daspsr \
+--ram_ft_path preset/models/DAPE.pth \
+--image_path preset/datasets/test_datasets \
+--output_dir preset/datasets/output \
+--start_point lr \
+--num_inference_steps 50 \
+--guidance_scale 5.5 \
+--process_size 512 \
+--spatial_noise_alpha 0.6 \
+--spatial_noise_edge_type sobel \
+--spatial_noise_edge_blur 0 \
+--spatial_noise_debug_every 200 

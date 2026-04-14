@@ -1,0 +1,5 @@
+DASP-SR
+
+This project contains code adapted from open-source real-world image super-resolution and diffusion restoration projects, including SeeSR and Diffusers-style components.
+
+The original copyright and attribution notices in adapted source files are preserved where applicable.
