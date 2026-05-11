@@ -25,6 +25,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 
 from pipelines.pipeline_daspsr import StableDiffusionControlNetPipeline
 from utils.misc import load_dreambooth_lora
+from utils.degradation_token import DegradationTokenEncoder, compute_degradation_stats
 from utils.wavelet_color_fix import wavelet_color_fix, adain_color_fix
 
 from ram.models.ram_lora import ram
@@ -131,13 +132,31 @@ def load_tag_model(args, device='cuda'):
     
     return model
     
-def get_validation_prompt(args, image, model, device='cuda'):
+def load_degradation_token_encoder(model_path, device, dtype, enabled=True):
+    if not enabled:
+        return None
+    state_path = os.path.join(model_path, "degradation_token", "pytorch_model.bin")
+    if not os.path.exists(state_path):
+        return None
+    encoder = DegradationTokenEncoder(stat_dim=6, token_dim=512)
+    encoder.load_state_dict(torch.load(state_path, map_location="cpu"))
+    encoder.eval()
+    return encoder.to(device, dtype=dtype)
+
+
+def get_validation_prompt(args, image, model, degradation_token_encoder=None, device='cuda'):
     validation_prompt = ""
  
     lq = tensor_transforms(image).unsqueeze(0).to(device)
     lq = ram_transforms(lq)
     res = inference(lq, model)
     ram_encoder_hidden_states = model.generate_image_embeds(lq)
+    if degradation_token_encoder is not None:
+        lr_for_stats = tensor_transforms(image).unsqueeze(0).to(device)
+        degradation_stats = compute_degradation_stats(lr_for_stats)
+        ram_encoder_hidden_states = degradation_token_encoder.prepend_to(
+            degradation_stats, ram_encoder_hidden_states
+        )
 
     validation_prompt = f"{res[0]}, {args.prompt},"
 
@@ -166,6 +185,10 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
 
     pipeline = load_daspsr_pipeline(args, accelerator, enable_xformers_memory_efficient_attention)
     model = load_tag_model(args, accelerator.device)
+    weight_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.float32
+    degradation_token_encoder = load_degradation_token_encoder(
+        args.daspsr_model_path, accelerator.device, weight_dtype, args.use_degradation_token
+    )
  
     if accelerator.is_main_process:
         generator = torch.Generator(device=accelerator.device)
@@ -181,7 +204,9 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             print(f'================== process {image_idx} imgs... ===================')
             validation_image = Image.open(image_name).convert("RGB")
 
-            validation_prompt, ram_encoder_hidden_states = get_validation_prompt(args, validation_image, model)
+            validation_prompt, ram_encoder_hidden_states = get_validation_prompt(
+                args, validation_image, model, degradation_token_encoder, accelerator.device
+            )
             validation_prompt += args.added_prompt # clean, extremely detailed, best quality, sharp, clean
             negative_prompt = args.negative_prompt #dirty, messy, low quality, frames, deformed, 
             
@@ -269,6 +294,8 @@ if __name__ == "__main__":
     parser.add_argument("--spatial_noise_edge_type", type=str, default="sobel", choices=["sobel", "laplacian"], help="Edge operator used to build edge_strength.")
     parser.add_argument("--spatial_noise_edge_blur", type=int, default=0, help="Optional blur kernel size for edge_strength (0 disables).")
     parser.add_argument("--spatial_noise_debug_every", type=int, default=0, help="Save edge_map/sigma_map debug images every N steps (0 disables).")
+    parser.add_argument("--use_degradation_token", action="store_true", default=True, help="Use saved explicit degradation statistic token encoder if present.")
+    parser.add_argument("--no_degradation_token", dest="use_degradation_token", action="store_false", help="Disable explicit degradation statistic token injection.")
     args = parser.parse_args()
     main(args)
 

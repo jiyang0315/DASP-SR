@@ -18,6 +18,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, CLIPImageProcessor
 
 from pipelines.pipeline_daspsr import StableDiffusionControlNetPipeline
 
+from utils.degradation_token import DegradationTokenEncoder, compute_degradation_stats
 from utils.wavelet_color_fix import wavelet_color_fix
 
 from ram.models.ram_lora import ram
@@ -83,6 +84,13 @@ class Predictor(BasePredictor):
         validation_pipeline._init_tiled_vae(encoder_tile_size=1024,decoder_tile_size=224)
         self.validation_pipeline = validation_pipeline
         weight_dtype = torch.float16
+        degradation_token_path = os.path.join(daspsr_model_path, "degradation_token", "pytorch_model.bin")
+        self.degradation_token_encoder = None
+        if os.path.exists(degradation_token_path):
+            degradation_token_encoder = DegradationTokenEncoder(stat_dim=6, token_dim=512)
+            degradation_token_encoder.load_state_dict(torch.load(degradation_token_path, map_location="cpu"))
+            degradation_token_encoder.eval()
+            self.degradation_token_encoder = degradation_token_encoder.to(device, dtype=weight_dtype)
     
         # Move text_encode and vae to gpu and cast to weight_dtype
         text_encoder.to(device, dtype=weight_dtype)
@@ -125,6 +133,12 @@ class Predictor(BasePredictor):
         lq = ram_transforms(lq)
         res = inference(lq, self.tag_model)
         ram_encoder_hidden_states = self.tag_model.generate_image_embeds(lq)
+        if self.degradation_token_encoder is not None:
+            lr_for_stats = tensor_transforms(input_image).unsqueeze(0).to(device)
+            degradation_stats = compute_degradation_stats(lr_for_stats)
+            ram_encoder_hidden_states = self.degradation_token_encoder.prepend_to(
+                degradation_stats, ram_encoder_hidden_states
+            )
         validation_prompt = f"{res[0]}, {positive_prompt},"
         validation_prompt = validation_prompt if user_prompt=='' else f"{user_prompt}, {validation_prompt}"
 

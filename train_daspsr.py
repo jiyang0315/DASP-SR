@@ -44,6 +44,7 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedCaptionDataset
+from utils.degradation_token import DegradationTokenEncoder, compute_degradation_stats
 from utils.spatial_noise import compute_edge_strength
 
 from typing import Mapping, Any
@@ -584,6 +585,18 @@ def parse_args(input_args=None):
         default=0,
         help="Save edge_map/sigma_map debug images every N global steps to <output_dir>/debug (0 disables).",
     )
+    parser.add_argument(
+        "--use_degradation_token",
+        action="store_true",
+        default=True,
+        help="Encode explicit blur/noise/JPEG/edge/brightness/contrast statistics as one image-conditioning token.",
+    )
+    parser.add_argument(
+        "--no_degradation_token",
+        dest="use_degradation_token",
+        action="store_false",
+        help="Disable explicit degradation statistic token injection.",
+    )
     
 
     if input_args is not None:
@@ -733,10 +746,17 @@ if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         #     model.save_pretrained(os.path.join(output_dir, sub_dir))
 
         #     i -= 1
-        assert len(models) == 2 and len(weights) == 2
-        for i, model in enumerate(models):
-            sub_dir = "unet" if isinstance(model, UNet2DConditionModel) else "controlnet"
-            model.save_pretrained(os.path.join(output_dir, sub_dir))
+        for model in models:
+            if isinstance(model, UNet2DConditionModel):
+                model.save_pretrained(os.path.join(output_dir, "unet"))
+            elif isinstance(model, ControlNetModel):
+                model.save_pretrained(os.path.join(output_dir, "controlnet"))
+            elif isinstance(model, DegradationTokenEncoder):
+                sub_dir = os.path.join(output_dir, "degradation_token")
+                os.makedirs(sub_dir, exist_ok=True)
+                torch.save(model.state_dict(), os.path.join(sub_dir, "pytorch_model.bin"))
+            else:
+                continue
             # make sure to pop weight so that corresponding model is not saved again
             weights.pop()
 
@@ -751,12 +771,16 @@ if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
 
         #     model.load_state_dict(load_model.state_dict())
         #     del load_model
-        assert len(models) == 2
         for i in range(len(models)):
             # pop models so that they are not loaded again
             model = models.pop()
 
             # load diffusers style into model
+            if isinstance(model, DegradationTokenEncoder):
+                state_path = os.path.join(input_dir, "degradation_token", "pytorch_model.bin")
+                if os.path.exists(state_path):
+                    model.load_state_dict(torch.load(state_path, map_location="cpu"))
+                continue
             if not isinstance(model, UNet2DConditionModel):
                 load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet") # , low_cpu_mem_usage=False, ignore_mismatched_sizes=True
             else:
@@ -797,6 +821,8 @@ RAM = ram(pretrained='preset/models/ram_swin_large_14m.pth',
             image_size=384,
             vit='swin_l')
 RAM.eval()
+
+degradation_token_encoder = DegradationTokenEncoder(stat_dim=6, token_dim=512) if args.use_degradation_token else None
 
 if args.enable_xformers_memory_efficient_attention:
     if is_xformers_available():
@@ -858,6 +884,8 @@ else:
 # Optimizer creation
 print(f'=================Optimize ControlNet and Unet ======================')
 params_to_optimize = list(controlnet.parameters()) + list(unet.parameters())
+if degradation_token_encoder is not None:
+    params_to_optimize += list(degradation_token_encoder.parameters())
 
 
 print(f'start to load optimizer...')
@@ -902,9 +930,13 @@ lr_scheduler = get_scheduler(
 )
 
 # Prepare everything with our `accelerator`.
-controlnet, unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-    controlnet, unet, optimizer, train_dataloader, lr_scheduler
-)
+prepare_items = [controlnet, unet, optimizer, train_dataloader, lr_scheduler]
+if degradation_token_encoder is not None:
+    prepare_items.append(degradation_token_encoder)
+prepared_items = accelerator.prepare(*prepare_items)
+controlnet, unet, optimizer, train_dataloader, lr_scheduler = prepared_items[:5]
+if degradation_token_encoder is not None:
+    degradation_token_encoder = prepared_items[5]
 
 # For mixed precision training we cast the text_encoder and vae weights to half-precision
 # as these models are only used for inference, keeping weights in full precision is not required.
@@ -1069,6 +1101,11 @@ for epoch in range(first_epoch, args.num_train_epochs):
             with torch.no_grad():
                 ram_image = batch["ram_values"].to(accelerator.device, dtype=weight_dtype)
                 ram_encoder_hidden_states = RAM.generate_image_embeds(ram_image)
+            if degradation_token_encoder is not None:
+                degradation_stats = compute_degradation_stats(controlnet_image.float())
+                ram_encoder_hidden_states = degradation_token_encoder.prepend_to(
+                    degradation_stats, ram_encoder_hidden_states
+                )
 
             down_block_res_samples, mid_block_res_sample = controlnet(
                 noisy_latents,
